@@ -2,11 +2,15 @@
 
 Provides `delegate(endpoint, question, context_id, trace_id, depth)` which
 sends a message to another A2A agent and returns the text response.
+
+Includes exponential backoff retry logic for fault tolerance.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 from uuid import uuid4
 
 import httpx
@@ -24,6 +28,8 @@ from a2a.types import (
 
 logger = logging.getLogger(__name__)
 
+MAX_RETRIES = 3
+
 
 async def delegate(
     endpoint: str,
@@ -34,6 +40,8 @@ async def delegate(
 ) -> str:
     """Send a question to an A2A agent and return the text response.
 
+    Automatically retries with exponential backoff on transient failures.
+
     Args:
         endpoint: Base URL of the target agent (e.g. "http://localhost:10101").
         question: The question to ask.
@@ -43,7 +51,41 @@ async def delegate(
 
     Returns:
         The agent's text response, or an empty string if none could be extracted.
+
+    Raises:
+        Exception: If all retry attempts are exhausted.
     """
+    last_exc: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return await _delegate_once(endpoint, question, context_id, trace_id, depth)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES:
+                wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
+                logger.warning(
+                    "Attempt %d/%d failed for %s (trace=%s): %s — retrying in %.1fs",
+                    attempt, MAX_RETRIES, endpoint, trace_id, exc, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error(
+                    "All %d attempts failed for %s (trace=%s): %s",
+                    MAX_RETRIES, endpoint, trace_id, exc,
+                )
+
+    raise last_exc  # type: ignore[misc]
+
+
+async def _delegate_once(
+    endpoint: str,
+    question: str,
+    context_id: str,
+    trace_id: str,
+    depth: int,
+) -> str:
+    """Execute a single delegation attempt (no retry)."""
     async with httpx.AsyncClient(timeout=300.0) as http_client:
         # Fetch agent card
         card_url = f"{endpoint}/.well-known/agent.json"
@@ -73,7 +115,8 @@ async def delegate(
         )
 
         logger.debug(
-            "Delegating to %s (depth=%d, trace=%s)", endpoint, depth, trace_id
+            "Delegating to %s (depth=%d, trace=%s, attempt=current)",
+            endpoint, depth, trace_id,
         )
 
         response = await client.send_message(request)
